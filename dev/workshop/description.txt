@@ -1,0 +1,30 @@
+Organize every chest around you with one key, and quick stack your inventory into the chests that already hold the same items.
+
+[h2]Organize (default key: Z)[/h2]
+[list]
+[*]Groups the items of all nearby chests by category: food, farming, healing, tools, weapons, armor, clothing, magic, resources, materials, refined materials, building and misc.
+[*]Related categories stay together, and while there is room each one starts in its own chest.
+[*]Chests keep the kind of items they already hold, so organizing again doesn't shuffle your base.
+[*]Upgraded chests (Elastispacer) are filled first, so huge stacks stay in a single slot.
+[/list]
+
+[h2]Quick stack (default key: X)[/h2]
+[list]
+[*]Moves stackable items from your inventory and backpack into nearby chests that already contain them.
+[*]Tools, weapons and clothes stay with you.
+[*]Can also fill iceboxes and salt boxes that already hold the item.
+[/list]
+
+[h2]Safe[/h2]
+[list]
+[*]Items are moved, never re-created, so durability, freshness, skins and contents are kept.
+[*]Works on dedicated servers and in worlds with caves.
+[*]Keys are ignored while you type in the chat or have a menu open.
+[*]World loot chests, the sacred chest in the ruins, burnt chests, chests opened by other players and Chester are left alone.
+[/list]
+
+[h2]Settings[/h2]
+Each player picks their own keys in the mod's client settings. The server sets the chest range, whether the backpack and iceboxes are used by quick stack, and whether the character announces what was done.
+
+[h2]Português[/h2]
+Organize todos os baús por perto com uma tecla (Z) e guarde os itens do inventário nos baús que já têm o mesmo item (X). Os itens são movidos, nunca recriados, então durabilidade, frescor e skins são mantidos. Funciona em servidor dedicado e em mundos com cavernas.

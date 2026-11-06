@@ -1,832 +1,758 @@
-require "vector3"
-local TheSim = GLOBAL.TheSim;
-local TheNet = GLOBAL.TheNet;
+--[[
+    Better Chests
 
---components that can be completely ignored
-local ignorableComponents = {
-	"inventoryitemmoisture",
-	"inspectable",
-	"hauntable",
-	"snowmandecor",
-	"vasedecoration",
-	"winter_treeseed",
-	"halloweenmoonmutable",
-	"inventoryitem",
-	"activatable",
-	"floater",
-	"weighable",
-	"propagator",
-	"tradable",
-	"burnable",
-	"bait",
-	"fishingrod",
-	"terraformer",
-	"rangedweapon",
-	"rangedlighter",
-	"extinguisher",
-	"nopunch",
-	"oceanfishingtackle",
-	"fuel",
-	"repairer",
-	"blinkstaff",
+    Client: a key press only sends a mod RPC, and only while no chat, console or menu has input focus.
+    Server: finds the usable chests around the player, plans the whole layout first, and only then moves
+    the real item entities with the game's own container calls. Items are never re-created, so durability,
+    freshness, skins and contents travel with them. Whatever cannot be placed goes back into a chest, then
+    into the player's inventory, and only as a last resort to the player's feet.
+]]
 
-	--IA recommend
-	"named",          -- Doesn't affect functionality
-	"writeable",      -- Doesn't affect functionality
-	"drawable",       -- Doesn't affect functionality
-	"repairable",     -- Doesn't affect sorting
-	"stackable",      -- Already handled by selfstacker
-	"fueled",         -- Doesn't affect sorting
-	"heater",         -- Doesn't affect sorting
-	"freezable",      -- Doesn't affect sorting
-	"shadowlevel",    -- Doesn't affect sorting
-	"teleportable",   -- Doesn't affect sorting
+local G = GLOBAL
+
+local NAMESPACE = "AutoOrganizeChests"
+local COOLDOWN = 1 -- seconds between two requests from the same player
+local MAX_PIECES_PER_SLOT = 1000 -- safety stop when emptying a slot
+
+--------------------------------------------------------------------------------------------------
+-- Settings and messages
+--------------------------------------------------------------------------------------------------
+
+local RADIUS = GetModConfigData("radius") or 10
+local QUICKSTACK_BACKPACK = GetModConfigData("quickstack_backpack") ~= false
+local QUICKSTACK_FRIDGES = GetModConfigData("quickstack_fridges") ~= false
+local FEEDBACK = GetModConfigData("feedback") ~= false
+
+local MESSAGES = {
+    ORGANIZED = "Organized %d chest%s.",
+    ALREADY_ORGANIZED = "These chests are already organized.",
+    NO_CHESTS = "There are no chests around here.",
+    NO_ROOM = "These chests don't have room to be organized.",
+    STACKED = "Stacked %d item%s into the chests.",
+    NOTHING_TO_STACK = "Nothing here to stack.",
 }
 
---components that will weight more on comparison by items.
-local weightedComponents = {
-	["mobdrop"] = 5,
-	["basicresource"] = 5,
-	["refinedresource"] = 5,
-	["molebait"] = 3,
-	["equippable"] = 3,
-	["tool"] = 3,
-	["cookable"] = 2,
-	["edible"] = 2,
-	["repairer"] = 2,
-	["fuel"] = 0.5,
-	--IA recommend
-	["armor"] = 3,          -- High priority for armor
-	["weapon"] = 3,         -- High priority for weapons
-	["farmplantable"] = 2,  -- Important for farming items
-	["healer"] = 2,         -- Important for healing items
-	["magic"] = 2,          -- Important for magical items
+local function Plural(count)
+    return count == 1 and "" or "s"
+end
+
+local function Say(player, text)
+    if FEEDBACK and player.components.talker ~= nil then
+        player.components.talker:Say(text)
+    end
+end
+
+--------------------------------------------------------------------------------------------------
+-- Which containers can be used
+--------------------------------------------------------------------------------------------------
+
+-- These carry the "chest" tag but belong to the world, a puzzle, a boat or a drone.
+local EXCLUDED_PREFABS = {
+    pandoraschest = true,
+    minotaurchest = true,
+    terrariumchest = true,
+    sunkenchest = true,
+    sacred_chest = true,
+    boat_ancient_container = true,
+    wx78_drone_delivery = true,
+    wx78_drone_delivery_small = true,
 }
 
---Tags that doesnt make sense
-local ignoreByItem = {
-	["flint"] = "edible",
-	["twigs"] = "edible",
-	["log"] = "edible",
-	["seeds"] = "edible",
-	["rocks"] = "edible",
-	["goldnugget"] = "edible",
-	["cutgrass"] = "edible",
-	["charcoal"] = "edible",
-	["boneshard"] = "edible",
-	["houndstooth"] = "edible",
-	["thulecite"] = "edible",
-	["boards"] = "edible",
-	["cutstone"] = "edible",
-	["cutreeds"] = "edible",
-	["axe"] = "weapon",
-	["pickaxe"] = "weapon",
-	["hammer"] = "weapon",
-	["bugnet"] = "weapon",
-	["shovel"] = "weapon"
+-- "structure" keeps creatures out: Snow Chester also has the "fridge" tag, and Chester and Hutch carry items.
+local MUST_TAGS = { "structure" }
+local CANT_TAGS = { "INLIMBO", "burnt", "FX", "NOCLICK" }
+local CHEST_TAGS = { "chest" }
+local STORAGE_TAGS = { "chest", "fridge", "saltbox" }
+
+-- allow_restricted lets quick stack use containers that only accept some items, like iceboxes and salt
+-- boxes: the game itself refuses what doesn't belong. Organize moves everything, so it skips them.
+local function IsUsable(inst, player, allow_restricted)
+    local container = inst.components.container
+    return container ~= nil
+        and not EXCLUDED_PREFABS[inst.prefab]
+        and not inst:HasTag("burnt")
+        and inst.components.inventoryitem == nil
+        and container:GetNumSlots() > 0
+        and container.canbeopened
+        and container.acceptsstacks
+        and not container.readonlycontainer
+        and not container.usespecificslotsforitems
+        and (allow_restricted or container.itemtestfn == nil)
+        and not container:IsOpenedByOthers(player)
+end
+
+-- Upgraded chests come first, so big stacks stay in them. Then world position, so the result doesn't
+-- depend on where the player stands.
+local function SortChests(list)
+    local order = {}
+    for _, inst in ipairs(list) do
+        local x, y, z = inst.Transform:GetWorldPosition()
+        order[inst] = { inst.components.container.infinitestacksize and 0 or 1, math.floor(x * 10 + 0.5), math.floor(z * 10 + 0.5) }
+    end
+    table.sort(list, function(a, b)
+        local ka, kb = order[a], order[b]
+        for i = 1, 3 do
+            if ka[i] ~= kb[i] then
+                return ka[i] < kb[i]
+            end
+        end
+        return a.GUID < b.GUID
+    end)
+    return list
+end
+
+local function FindContainers(player, include_fridges, allow_restricted)
+    local x, y, z = player.Transform:GetWorldPosition()
+    local found = G.TheSim:FindEntities(x, y, z, RADIUS, MUST_TAGS, CANT_TAGS, include_fridges and STORAGE_TAGS or CHEST_TAGS)
+    local usable = {}
+    for _, inst in ipairs(found) do
+        if IsUsable(inst, player, allow_restricted) then
+            table.insert(usable, inst)
+        end
+    end
+    return SortChests(usable)
+end
+
+--------------------------------------------------------------------------------------------------
+-- Categories
+--------------------------------------------------------------------------------------------------
+
+-- Categories in the order they are laid out. Related categories form a family that stays together.
+local CATEGORIES = {
+    { "food", "provisions" }, { "farming", "provisions" }, { "healing", "provisions" },
+    { "tools", "equipment" }, { "weapons", "equipment" }, { "armor", "equipment" },
+    { "clothing", "equipment" }, { "magic", "equipment" },
+    { "resources", "materials" }, { "materials", "materials" }, { "refined", "materials" },
+    { "building", "materials" },
+    { "misc", "misc" },
+}
+local CATEGORY_FAMILY, FAMILY_RANK = {}, {}
+for rank, entry in ipairs(CATEGORIES) do
+    CATEGORY_FAMILY[entry[1]] = entry[2]
+    FAMILY_RANK[entry[2]] = FAMILY_RANK[entry[2]] or rank
+end
+
+local BASIC_RESOURCES = {
+    log = true, twigs = true, cutgrass = true, cutreeds = true, rocks = true, flint = true,
+    goldnugget = true, nitre = true, marble = true, moonrocknugget = true, charcoal = true,
+    ash = true, ice = true, saltrock = true, thulecite_pieces = true, moonglass = true, boneshard = true,
 }
 
-local extraTags = {
-	["houndstooth"] = { "mobdrop" },
-	["pigskin"] = { "mobdrop" },
-	["log"] = { "basicresource" },
-	["stick"] = { "basicresource" },
-	["cutgrass"] = { "basicresource" },
-	["stone"] = { "basicresource" },
-	["flint"] = { "basicresource" },
-	["cutstone"] = { "refinedresource" },
-	["boards"] = { "refinedresource" },
-	["papyrus"] = { "refinedresource" },
-	["rope"] = { "refinedresource" },
-	["electricaldoodad"] = { "refinedresource" },
+local FOOD_TYPES = { MEAT = true, VEGGIE = true, GENERIC = true, GOODIES = true, INSECT = true, BERRY = true, RAW = true }
+
+-- Crafting menu filters in priority order. A crafted item gets the category of the first filter
+-- that lists its recipe, so modded recipes are categorized too.
+local FILTER_CATEGORIES = {
+    { "MAGIC", "magic" }, { "WEAPONS", "weapons" }, { "ARMOUR", "armor" }, { "TOOLS", "tools" },
+    { "LIGHT", "tools" }, { "FISHING", "tools" }, { "RIDING", "tools" },
+    { "CLOTHING", "clothing" }, { "WINTER", "clothing" }, { "SUMMER", "clothing" }, { "RAIN", "clothing" },
+    { "RESTORATION", "healing" }, { "GARDENING", "farming" }, { "REFINE", "refined" },
+    { "COOKING", "building" }, { "STRUCTURES", "building" }, { "DECOR", "building" },
+    { "SEAFARING", "building" }, { "CONTAINERS", "building" }, { "PROTOTYPERS", "building" },
 }
 
-local possibleTags = {
-	"magic", "plantable", "healer", "structure", "wall", "spicedfood", "renewable", "preparedfood", "honeyed", "monstermeat",
-	"quakedebris", "cattoy", "dryable", "sharp", "pointy", "jab",  "tool", "lureplant_bait", "rawmeat", "shadowlevel",
-	"ressurector", "HASHEATER", "marble", "grass", "shadow", "shadow_item", "shell", "molebait", "sanity", "fossil", "hat",
-	"wood", "metal", "magiciantool", "hide", "umbrella", "heavyarmor", "frozen", "icebox_valid", "nightvision", "goggles",
-	"handfed", "shadowdominance", "dreadstone", "cloth", "junk", "cannotuse", "meat", "veggie", "mobdrop", "basicresource",
-	"refinedresource"
-}
+local recipe_categories = nil -- built on first use, after every mod has added its recipes
 
-local function CountDictionary(dic)
-	local validItemsCount = 0
-	for _ in pairs(dic) do validItemsCount = validItemsCount + 1 end
-	return validItemsCount
+local function GetRecipeCategory(prefab)
+    if recipe_categories == nil then
+        recipe_categories = {}
+        local filters = G.rawget(G, "CRAFTING_FILTERS")
+        local recipes = G.rawget(G, "AllRecipes")
+        for _, entry in ipairs(FILTER_CATEGORIES) do
+            local filter = filters ~= nil and filters[entry[1]] or nil
+            if filter ~= nil and type(filter.recipes) == "table" then
+                for _, recipe_name in ipairs(filter.recipes) do
+                    local recipe = recipes ~= nil and recipes[recipe_name] or nil
+                    local product = recipe ~= nil and recipe.product or recipe_name
+                    if recipe_categories[product] == nil then
+                        recipe_categories[product] = entry[2]
+                    end
+                end
+            end
+        end
+    end
+    return recipe_categories[prefab]
 end
 
-local function GetNearbyChests(player)
-	if not player then
-		return
-	end
+local function GetCategory(item)
+    local prefab = item.prefab
+    if BASIC_RESOURCES[prefab] then
+        return "resources"
+    end
 
-	-- Get player position
-	local x, y, z = player.Transform:GetWorldPosition()
+    local cmp = item.components
+    if cmp.healer ~= nil then
+        return "healing"
+    end
 
-	-- Find nearby chests
-	local allCloseChests = TheSim:FindEntities(x, y, z, 10, {"chest"})
+    local edible = cmp.edible
+    if edible ~= nil and edible.foodtype == "SEEDS" then
+        return "farming"
+    elseif edible ~= nil and FOOD_TYPES[edible.foodtype] and (cmp.perishable ~= nil or item:HasTag("preparedfood")) then
+        return "food"
+    end
 
-	local closeChests = {}
-	for _, chest in pairs(allCloseChests) do
-		closeChests[_] = chest.prefab
-	end
+    local deploy_mode = cmp.deployable ~= nil and cmp.deployable.mode or nil
+    if cmp.fertilizer ~= nil or deploy_mode == G.DEPLOYMODE.PLANT then
+        return "farming"
+    elseif cmp.armor ~= nil then
+        return "armor"
+    end
 
-	return closeChests, allCloseChests;
+    local from_recipe = GetRecipeCategory(prefab)
+    if from_recipe ~= nil then
+        return from_recipe
+    elseif item:HasTag("tool") then
+        return "tools"
+    elseif cmp.weapon ~= nil then
+        return "weapons"
+    elseif cmp.equippable ~= nil then
+        return "clothing"
+    elseif item:HasTag("gem") or cmp.spellcaster ~= nil then
+        return "magic"
+    elseif deploy_mode == G.DEPLOYMODE.TURF or deploy_mode == G.DEPLOYMODE.WALL then
+        return "building"
+    elseif cmp.stackable ~= nil then
+        return "materials"
+    end
+    return "misc"
 end
 
-local function GetAllItemsFromChests(chestsRef)
-	local allItemsByChest = {}
-	local itemsReference = {}
-	for indexChest, chest in pairs(chestsRef) do
-		local itemsInChest = {}
-		if chest.components.container then
-			for i = 1, chest.components.container:GetNumSlots() do
-				local item = chest.components.container:GetItemInSlot(i)
-				if item then
-					table.insert(itemsInChest, item.prefab)
-					table.insert(itemsReference, item)
-				end
-			end
-		end
+--------------------------------------------------------------------------------------------------
+-- Stacks
+--------------------------------------------------------------------------------------------------
 
-		allItemsByChest[chest] = itemsInChest;
-	end
-	return allItemsByChest, itemsReference
+local function StackSize(item)
+    return item.components.stackable ~= nil and item.components.stackable:StackSize() or 1
 end
 
-local function GetAllComponentsFromItems(itemsRef)
-	-- Iterate through chests and their contents
-	local componentReference = {}
-	local componentsByItem = {}
-	for itemIdx, item in pairs(itemsRef) do
-		local componentsFoundInItem = {}
-		-- Get all components
-		if item.components then
-			for componentName, comp in pairs(item.components) do
-				local safeComponent = true;
-				for _, bannedComponent in pairs(ignorableComponents) do
-					if componentName == bannedComponent then
-						safeComponent = false;
-					end
-				end
-
-				for itemName, ignoreComponent in pairs(ignoreByItem) do
-					if (item.prefab == itemName and componentName == ignoreComponent) then
-						safeComponent = false;
-					end
-				end
-
-				if safeComponent then
-					table.insert(componentsFoundInItem, componentName)
-					table.insert(componentReference, comp)
-				end
-			end
-		end
-			componentsByItem[item.prefab] = componentsFoundInItem;
-	end
-	return componentsByItem, componentReference;
+-- Inside an upgraded chest a stack reports an infinite maxsize; originalmaxsize keeps the real one.
+local function StackMax(item)
+    local stackable = item.components.stackable
+    return stackable.originalmaxsize or stackable.maxsize
 end
 
-local function GetAllTagsFromItems(itemsRef)
-	local tagsByItem = {}
-	for _, itemRef in pairs(itemsRef) do
-		local prefab = itemRef.prefab
-		tagsByItem[prefab] = {}
-		for _, tag in ipairs(possibleTags) do
-			if itemRef:HasTag(tag) then
-				table.insert(tagsByItem[prefab], tag)
-			end
-		end
-
-		for itemName, tagList in pairs(extraTags) do
-			if tostring(itemRef.prefab) == itemName then
-				for _, extraTag in pairs(tagList) do
-					table.insert(tagsByItem[prefab], extraTag)
-				end
-			end
-		end
-	end
-	return tagsByItem
+-- Items the game merges into one stack share a key. Anything else is handled one entity at a time.
+local function StackKey(item)
+    if item.components.stackable == nil or item.stackable_CanStackWithFn ~= nil then
+        return nil
+    end
+    return item.prefab .. "|" .. (item.skinname or "")
 end
 
-local function GetCrossedTableValues(allItemsList, tagsByItem)
-	local matrixComparison = {}
-	for item1, comps1 in pairs(allItemsList) do
-		matrixComparison[item1] = {}
-		local tags1 = tagsByItem[item1] or {} -- Get tags for item1
-		for item2, comps2 in pairs(allItemsList) do
-			local tags2 = tagsByItem[item2] or {} -- Get tags for item2
-			local equalFeatures = 0
-			if item1 == item2 then
-				matrixComparison[item1][item2] = 1
-			else
-				local extraWeight = 0
-
-				-- Compare components
-				for _, comp1 in ipairs(comps1) do
-					for _, comp2 in ipairs(comps2) do
-						if comp1 == comp2 then
-							local weight = weightedComponents[comp1] or 1
-							equalFeatures = equalFeatures + weight
-							extraWeight = extraWeight + weight
-							break
-						end
-					end
-				end
-
-				-- Compare tags
-				for _, tag1 in ipairs(tags1) do
-					for _, tag2 in ipairs(tags2) do
-						if tag1 == tag2 then
-							local weight = weightedComponents[tag1] or 1 -- Use component weight or default to 1
-							equalFeatures = equalFeatures + weight
-							extraWeight = extraWeight + weight
-							break
-						end
-					end
-				end
-
-				-- Calculate total features
-				local totalFeatures = math.max(#comps1 + #tags1, #comps2 + #tags2) + extraWeight
-				if totalFeatures <= 0 then
-					totalFeatures = 1
-				end
-				local result = equalFeatures / totalFeatures
-				matrixComparison[item1][item2] = result
-			end
-		end
-	end
-	return matrixComparison
+local function IsLoose(item)
+    return item:IsValid() and item.components.inventoryitem ~= nil and item.components.inventoryitem.owner == nil
 end
 
---IA Generated
-local function TableToString(tbl, indent, seen)
-	indent = indent or 0
-	seen = seen or {} -- Table to track already processed tables
-	local str = ""
-	local indentStr = string.rep("  ", indent)
+--------------------------------------------------------------------------------------------------
+-- Organize: read, plan, then move
+--------------------------------------------------------------------------------------------------
 
-	-- Check if the table has already been processed
-	if seen[tbl] then
-		return str .. indentStr .. tostring(tbl) .. " (circular reference)\n"
-	end
-	seen[tbl] = true -- Mark the table as processed
+-- Reads every chest without changing anything.
+local function TakeSnapshot(chests)
+    local snapshot = { chests = {}, blocks = {}, presence = {}, count = 0, capacity = 0 }
+    local block_of_key = {}
+    for index, inst in ipairs(chests) do
+        local container = inst.components.container
+        local chest = {
+            inst = inst,
+            container = container,
+            numslots = container:GetNumSlots(),
+            infinite = container.infinitestacksize == true,
+            slots = {},
+        }
+        snapshot.chests[index] = chest
+        snapshot.capacity = snapshot.capacity + chest.numslots
 
-	for k, v in pairs(tbl) do
-		if type(v) == "table" then
-			str = str .. indentStr .. tostring(k) .. ":\n"
-			str = str .. TableToString(v, indent + 1, seen)
-		else
-			str = str .. indentStr .. tostring(k) .. ": " .. tostring(v) .. "\n"
-		end
-	end
+        for slot = 1, chest.numslots do
+            local item = container:GetItemInSlot(slot)
+            if item ~= nil then
+                chest.slots[slot] = item
+                snapshot.count = snapshot.count + 1
 
-	return str
+                local category = GetCategory(item)
+                snapshot.blocks[category] = snapshot.blocks[category] or {}
+                local family = CATEGORY_FAMILY[category]
+                local presence = snapshot.presence[family]
+                if presence == nil then
+                    presence = { slots = {}, first = {} }
+                    snapshot.presence[family] = presence
+                end
+                presence.slots[index] = (presence.slots[index] or 0) + 1
+                presence.first[index] = presence.first[index] or slot
+
+                local key = StackKey(item)
+                local block = key ~= nil and block_of_key[key] or nil
+                if block ~= nil then
+                    block.units = block.units + StackSize(item)
+                else
+                    block = { prefab = item.prefab, skin = item.skinname or "", chest = index, slot = slot }
+                    if key ~= nil then
+                        block.key, block.units, block.max = key, StackSize(item), StackMax(item)
+                        block_of_key[key] = block
+                    else
+                        block.item = item
+                    end
+                    table.insert(snapshot.blocks[category], block)
+                end
+            end
+        end
+    end
+
+    for _, blocks in pairs(snapshot.blocks) do
+        table.sort(blocks, function(a, b)
+            if a.prefab ~= b.prefab then
+                return a.prefab < b.prefab
+            elseif a.skin ~= b.skin then
+                return a.skin < b.skin
+            elseif a.chest ~= b.chest then
+                return a.chest < b.chest
+            end
+            return a.slot < b.slot
+        end)
+    end
+    return snapshot
 end
 
-local function CheckDeviationFromCrossedTable(matrixCrossingTable)
-	local totalDeviation = {}
+-- Each family is anchored to the chest that holds most of it today, so chests keep what they store.
+-- Inside a family the categories always follow the CATEGORIES order.
+local function LayoutOrder(snapshot)
+    local families, anchor = {}, {}
+    for family, presence in pairs(snapshot.presence) do
+        local best
+        for index, slots in pairs(presence.slots) do
+            if best == nil or slots > presence.slots[best] or (slots == presence.slots[best] and index < best) then
+                best = index
+            end
+        end
+        anchor[family] = { chest = best, slot = presence.first[best] }
+        table.insert(families, family)
+    end
+    table.sort(families, function(a, b)
+        local x, y = anchor[a], anchor[b]
+        if x.chest ~= y.chest then
+            return x.chest < y.chest
+        elseif x.slot ~= y.slot then
+            return x.slot < y.slot
+        end
+        return FAMILY_RANK[a] < FAMILY_RANK[b]
+    end)
 
-	for item1, item2AndScores in pairs(matrixCrossingTable) do
-		local itemDeviation = 0
-		for item2, score in pairs(item2AndScores) do
-			itemDeviation = itemDeviation + (1 - score)
-		end
-		totalDeviation[item1] = itemDeviation
-	end
-
-	-- Sort the array by deviation (ascending order)
-	table.sort(totalDeviation, function(a, b)
-		return a.deviation < b.deviation
-	end)
-
-	return totalDeviation
+    local order = {}
+    for _, family in ipairs(families) do
+        local first = true
+        for _, entry in ipairs(CATEGORIES) do
+            if entry[2] == family and snapshot.blocks[entry[1]] ~= nil then
+                table.insert(order, { category = entry[1], new_family = first })
+                first = false
+            end
+        end
+    end
+    return order
 end
 
-local function ReconstructOriginalTable(deviationArray)
-	local totalDeviation = {}
-	for _, entry in ipairs(deviationArray) do
-		totalDeviation[entry.item] = entry.deviation
-	end
-	return totalDeviation
+-- Lays the categories out chest after chest like books on a shelf. Spare slots are spent first on
+-- starting each family in a fresh chest, and on starting a category in a fresh chest only when plenty
+-- are left. Returns the plan and how many slots it fills, or nil when everything doesn't fit.
+local function PlanLayout(snapshot, order, spare)
+    local chests = snapshot.chests
+    local largest, families_left = 0, 0
+    for _, chest in ipairs(chests) do
+        largest = math.max(largest, chest.numslots)
+    end
+    for _, entry in ipairs(order) do
+        if entry.new_family then
+            families_left = families_left + 1
+        end
+    end
+
+    local plan, filled = {}, 0
+    for index = 1, #chests do
+        plan[index] = {}
+    end
+    local current, used = 1, 0
+    local function Fill(slots)
+        used, filled = used + slots, filled + slots
+        if used >= chests[current].numslots then
+            current, used = current + 1, 0
+        end
+    end
+
+    for _, entry in ipairs(order) do
+        if entry.new_family then
+            families_left = families_left - 1
+        end
+        if used > 0 then
+            local free = chests[current].numslots - used
+            local reserve = entry.new_family and 0 or families_left * (largest - 1)
+            if spare - reserve >= free then
+                spare = spare - free
+                current, used = current + 1, 0
+            end
+        end
+        for _, block in ipairs(snapshot.blocks[entry.category]) do
+            if block.item ~= nil then
+                if current > #chests then
+                    return nil
+                end
+                table.insert(plan[current], { item = block.item })
+                Fill(1)
+            else
+                local remaining = block.units
+                while remaining > 0 do
+                    if current > #chests then
+                        return nil
+                    end
+                    local chest = chests[current]
+                    local per_slot = chest.infinite and remaining or block.max
+                    local slots = math.min(math.ceil(remaining / per_slot), chest.numslots - used)
+                    local units = math.min(remaining, slots * per_slot)
+                    table.insert(plan[current], { key = block.key, units = units, max = block.max })
+                    remaining = remaining - units
+                    Fill(slots)
+                end
+            end
+        end
+    end
+    return plan, filled
 end
 
-
-local function GetKeyItemForEachChest(allCloseChests, deviationValue)
-	local keyItemByChest = {}
-	for i = 1, #allCloseChests do
-		local itemIndex = 1
-		for item, deviation in pairs(deviationValue) do
-			if itemIndex == i then
-				print("Chest idx: " .. tostring(i) .. " Choosed: " .. item)
-				keyItemByChest[i] = item
-				break
-			end
-			itemIndex = itemIndex + 1
-		end
-	end
-	return keyItemByChest;
+-- What each slot of a chest will hold once the plan is applied.
+local function ExpectedSlots(chest, entries)
+    local slots = {}
+    for _, entry in ipairs(entries) do
+        if entry.item ~= nil then
+            table.insert(slots, entry.item)
+        elseif chest.infinite then
+            table.insert(slots, entry.key .. "#" .. entry.units)
+        else
+            local left = entry.units
+            while left > 0 do
+                local units = math.min(left, entry.max)
+                table.insert(slots, entry.key .. "#" .. units)
+                left = left - units
+            end
+        end
+    end
+    return slots
 end
 
-local function CreateRecursiveStructureWithKeys(keyItemByChest, chestRef)
-	local itemListInChest = {}
-	for i = 1, #keyItemByChest do
-		local chest = chestRef[i]
-		local keyItem = keyItemByChest[i]
-		itemListInChest[chest] = {keyItem}
-	end
-	return itemListInChest
+local function SlotSignature(item)
+    local key = StackKey(item)
+    return key ~= nil and (key .. "#" .. StackSize(item)) or item
 end
 
-local function GetQuantityOfEachItem(itemsRef)
-	local nonStackables = {}
-	local stackables = {}
-	for itemIdx, item in pairs(itemsRef) do
-		if(item.components.stackable) then
-			if stackables[item.prefab] == nil then
-				stackables[item.prefab] = item.components.stackable:StackSize()
-			else
-				stackables[item.prefab] = stackables[item.prefab] + item.components.stackable:StackSize()
-			end
-		else
-			if nonStackables[item.prefab] == nil then
-				nonStackables[item.prefab] = 1
-			else
-				nonStackables[item.prefab] = nonStackables[item.prefab] + 1
-			end
-		end
-	end
-	return nonStackables, stackables
+local function IsAlreadyOrganized(snapshot, plan)
+    for index, chest in ipairs(snapshot.chests) do
+        local expected = ExpectedSlots(chest, plan[index])
+        for slot = 1, chest.numslots do
+            local item = chest.slots[slot]
+            if item == nil then
+                if expected[slot] ~= nil then
+                    return false
+                end
+            elseif expected[slot] == nil or SlotSignature(item) ~= expected[slot] then
+                return false
+            end
+        end
+    end
+    return true
 end
 
-local function GetActualValidItems(itemsSortedInChest, matrixCrossingTable)
-	local lockedItems = {}
-	for chest, itemList in pairs(itemsSortedInChest) do
-		for _, item in pairs(itemList) do
-			lockedItems[item] = true
-		end
-	end
-
-	TheNet:SystemMessage("Locked Items: " .. TableToString(lockedItems))
-	local validItems = {}
-	for chest, alreadyOnChestItems in pairs(itemsSortedInChest) do
-		local crossedInfo = {}
-		for _, item in pairs(alreadyOnChestItems) do
-			local uncrossableItems = {}
-			local crossedItems = {}
-			for crossingItem, crossedPercentage in pairs(matrixCrossingTable[item]) do
-				local isLockedItem = false
-				--Check if score is 0, and store on table.
-				for lockedItem, locked in pairs(lockedItems) do
-					if crossingItem == lockedItem then
-						isLockedItem = true
-					end
-				end
-
-				-- If the item is not locked, add it to validItems
-				if not isLockedItem then
-					if crossedPercentage <= 0 then
-						table.insert(crossedItems, { item = crossingItem, percent = crossedPercentage })
-					else
-						table.insert(uncrossableItems, item)
-					end
-				end
-			end
-			if #crossedItems > 0 then
-				crossedInfo[item] = {validItems = crossedItems, invalidItems = uncrossableItems}
-			end
-		end
-
-		if CountDictionary(crossedInfo) > 0 then
-			validItems[chest] = crossedInfo
-		end
-	end
-
-	if #validItems > 0 then
-		for chest, itemList in pairs(validItems) do
-			for keyItem, crossedItemList in pairs(itemList) do
-				local crossedValidItems = crossedItemList.validItems;
-				table.sort(crossedValidItems, function(a, b)
-					return a.percent > b.percents
-				end)
-			end
-		end
-	end
-
-	return validItems
+local function AddToPool(pool, item)
+    table.insert(pool.all, item)
+    local key = StackKey(item)
+    if key ~= nil then
+        pool.stacks[key] = pool.stacks[key] or {}
+        table.insert(pool.stacks[key], item)
+    end
 end
 
-local function PutItemsInChest(stackables, nonStackables, sortedItemsInChest, chestRef)
-	-- Clear all chests
-	for _, chest in pairs(chestRef) do
-		if chest.components.container then
-			for i = 1, chest.components.container:GetNumSlots() do
-				local item = chest.components.container:GetItemInSlot(i)
-				if item then
-					chest.components.container:RemoveItemBySlot(i)
-				end
-			end
-		end
-	end
-
-	-- Add items to chests based on sortedItemsInChest
-	for chest, itemList in pairs(sortedItemsInChest) do
-		if chest then
-			for _, item in pairs(itemList) do
-				if chest.components.container then
-					-- Determine the quantity of the item to add
-					local quantity = stackables[item] or nonStackables[item] or 1
-
-					-- Add the item to the chest
-					for i = 1, quantity do
-						local newItem = GLOBAL.SpawnPrefab(item)
-						if newItem then
-							if not chest.components.container:GiveItem(newItem) then
-								-- Drop the item at the chest's position instead of deleting it
-								newItem.Transform:SetPosition(chest.Transform:GetWorldPosition())
-							end
-						end
-					end
-				end
-			end
-		end
-	end
+local function TakeEverything(snapshot, pool)
+    for _, chest in ipairs(snapshot.chests) do
+        for slot = 1, chest.numslots do
+            -- keepoverstacked: an oversized stack from an upgraded chest comes out in normal-size pieces
+            -- instead of spilling its excess on the ground.
+            for _ = 1, MAX_PIECES_PER_SLOT do
+                local item = chest.container:RemoveItemBySlot(slot, true)
+                if item == nil then
+                    break
+                end
+                AddToPool(pool, item)
+            end
+        end
+    end
 end
 
-local function RemoveItemsFromPlayerInventory(playerInventory, itemsRef)
-	local removedItemsFromInventory = {}
-	for i = 1, playerInventory:GetNumSlots() do
-		local item = playerInventory:GetItemInSlot(i)
-		if item then
-			for _, itemRef in pairs(itemsRef) do
-				if itemRef.prefab == item.prefab then
-					playerInventory:RemoveItemBySlot(i)
-					if removedItemsFromInventory[item] == nil then
-						removedItemsFromInventory[item] = item.components.stackable:StackSize()
-					else
-						removedItemsFromInventory[item] = removedItemsFromInventory[item] + item.components.stackable:StackSize()
-					end
-				end
-			end
-		end
-	end
-	return removedItemsFromInventory
+local function GiveStacks(container, pool, key, units)
+    local list = pool.stacks[key]
+    while units > 0 and list ~= nil and #list > 0 do
+        local item = table.remove(list)
+        if item:IsValid() then
+            local piece = item
+            if StackSize(item) > units then
+                -- The game's own split keeps freshness, skin, wetness and temperature.
+                piece = item.components.stackable:Get(units)
+                table.insert(list, item)
+                table.insert(pool.all, piece)
+            end
+            local size = StackSize(piece)
+            if not container:GiveItem(piece, nil, nil, false) then
+                if piece:IsValid() then
+                    table.insert(list, piece)
+                end
+                return
+            end
+            units = units - size
+        end
+    end
 end
 
-local function SortRemovedItemsInChests(allItemsByChest, removedItemsFromInventory)
-	-- Iterate over all chests
-	for chest, itemsPrefab in pairs(allItemsByChest) do
-		-- Iterate over the items in the chest
-		for _, itemPrefab in pairs(itemsPrefab) do
-
-			-- Check if the item matches any removed item
-			for removedItem, quantity in pairs(removedItemsFromInventory) do
-				if itemPrefab == removedItem.prefab then
-					-- Add the item to the chest
-					for i = 1, quantity do
-						local newItem = GLOBAL.SpawnPrefab(itemPrefab)
-						if newItem then
-							if not chest.components.container:GiveItem(newItem) then
-								newItem.Transform:SetPosition(chest.Transform:GetWorldPosition())
-							end
-						end
-					end
-				end
-			end
-		end
-	end
+local function ApplyPlan(snapshot, plan, pool)
+    for index, chest in ipairs(snapshot.chests) do
+        for _, entry in ipairs(plan[index]) do
+            if entry.item ~= nil then
+                chest.container:GiveItem(entry.item, nil, nil, false)
+            else
+                GiveStacks(chest.container, pool, entry.key, entry.units)
+            end
+        end
+    end
 end
 
-local function GetOneItemForEachChestBasedOnContents(itemListByChest, validItems)
-	local scoreListByChest = {}
-	for chest, itemListInChest in pairs(itemListByChest) do
-		--Get best item comparing all items inside the chest
-		local itemAndTotalScore = {}
-		for _, item in pairs(itemListInChest) do
-			for i, itemAndScore in pairs(validItems[chest][item]) do
-				local bestScoreItem = itemAndScore.item
-				local bestSimilarity = itemAndScore.percent
-
-				if itemAndTotalScore[item] == nil then
-					itemAndTotalScore[bestScoreItem] = bestSimilarity
-				else
-					itemAndTotalScore[bestScoreItem] = itemAndTotalScore[bestScoreItem] + bestSimilarity
-				end
-			end
-		end
-		scoreListByChest[chest] = itemAndTotalScore
-	end
-
-	local chosenItemByChest = {}
-	for chest, itemScoreList in pairs(scoreListByChest) do
-		local bestScore = -1
-		local itemChose = nil
-		for item, score in pairs(itemScoreList) do
-			local locked = false
-			for inputChest, inputItem in pairs(chosenItemByChest) do
-				if item == inputItem then
-					locked = true
-				end
-			end
-
-			if not locked then
-				if score > bestScore then
-					TheNet:SystemMessage("Find a better item: ".. tostring(item) .. " / " .. tostring(score))
-					bestScore = score
-					itemChose = item
-				end
-			end
-		end
-		chosenItemByChest[chest] = itemChose
-	end
-
-	local output = {}
-	for chest, items in pairs(itemListByChest) do
-		output[chest] = {}
-		for i = 1, #items do -- Iterate as array
-			output[chest][i] = items[i]
-		end
-	end
-
-	for chest, insertItem in pairs(chosenItemByChest) do
-		if output[chest] then
-			table.insert(output[chest], insertItem)
-		end
-	end
-
-	return output
+local function TryGive(container, item)
+    local ok, placed = G.pcall(container.GiveItem, container, item, nil, nil, false)
+    return ok and placed
 end
 
---IA Generated
-local function GetMostFrequentComponent(chest)
-	local componentWeights = {} -- Table to store the total weight of each component
-	local mostFrequentComponent = nil
-	local maxWeight = 0
-
-	-- Iterate through items in the chest
-	for slot = 1, chest.components.container:GetNumSlots() do
-		local item = chest.components.container:GetItemInSlot(slot)
-		if item then
-			-- Iterate through the item's components
-			for componentName, _ in pairs(item.components) do
-				local safeComponent = true
-				for _, ignorableComp in pairs(ignorableComponents) do
-					if componentName == ignorableComp then
-						safeComponent = false
-					end
-				end
-
-				if safeComponent then
-					-- Get the weight of the component (default to 1 if not in weightedComponents)
-					local weight = weightedComponents[componentName] or 1
-
-					-- Add the weight to the component's total
-					componentWeights[componentName] = (componentWeights[componentName] or 0) + weight
-
-					-- Update the most frequent component
-					if componentWeights[componentName] > maxWeight then
-						mostFrequentComponent = componentName
-						maxWeight = componentWeights[componentName]
-					end
-				end
-			end
-		end
-	end
-
-	return mostFrequentComponent
+-- Gives a loose item to the player. If even that fails it lands at the player's feet, never at the
+-- spot where the game left it after taking it out of a container.
+local function GiveToPlayer(player, item)
+    local inventory = player.components.inventory
+    G.pcall(inventory.GiveItem, inventory, item, nil, player:GetPosition())
+    if IsLoose(item) then
+        item.Transform:SetPosition(player.Transform:GetWorldPosition())
+    end
 end
 
---IA Generated
-local function AddNamedComponent(chest)
-	if not chest.components.named then
-		chest:AddComponent("named")
-	end
+-- Anything still loose goes into the first chest with room, then to the player.
+local function PutBackLooseItems(items, containers, player)
+    local count = 0
+    for _, item in ipairs(items) do
+        if IsLoose(item) then
+            count = count + 1
+            for _, container in ipairs(containers) do
+                if not IsLoose(item) or (container.inst:IsValid() and TryGive(container, item)) then
+                    break
+                end
+            end
+            if IsLoose(item) then
+                GiveToPlayer(player, item)
+            end
+        end
+    end
+    return count
 end
 
---IA Generated
-local function RenameChestBasedOnComponents(chest)
-	AddNamedComponent(chest)
-	if chest.components.named then
-		local mostFrequentComponent = GetMostFrequentComponent(chest)
-		if mostFrequentComponent then
-			local componentName = string.gsub(mostFrequentComponent, "component%.", "")
-			chest.components.named:SetName("Chest of " .. componentName)
-		else
-			chest.components.named:SetName("Mystery Chest")
-		end
-	end
+local function Organize(player)
+    local chests = FindContainers(player, false, false)
+    if #chests == 0 then
+        return Say(player, MESSAGES.NO_CHESTS)
+    end
+
+    local snapshot = TakeSnapshot(chests)
+    if snapshot.count == 0 then
+        return Say(player, MESSAGES.ALREADY_ORGANIZED)
+    end
+    -- A tight first pass measures exactly how many slots everything needs; the free slots it leaves
+    -- are then spent on giving families and categories their own chests.
+    local order = LayoutOrder(snapshot)
+    local plan, filled = PlanLayout(snapshot, order, 0)
+    if plan == nil then
+        return Say(player, MESSAGES.NO_ROOM)
+    end
+    plan = PlanLayout(snapshot, order, snapshot.capacity - filled) or plan
+    if IsAlreadyOrganized(snapshot, plan) then
+        return Say(player, MESSAGES.ALREADY_ORGANIZED)
+    end
+
+    local pool = { all = {}, stacks = {} }
+    local ok, err = G.pcall(function()
+        TakeEverything(snapshot, pool)
+        ApplyPlan(snapshot, plan, pool)
+    end)
+    local containers = {}
+    for index, chest in ipairs(snapshot.chests) do
+        containers[index] = chest.container
+    end
+    local put_back = PutBackLooseItems(pool.all, containers, player)
+    if not ok then
+        print("[Better Chests] organize failed and items were put back: " .. tostring(err))
+    elseif put_back > 0 then
+        print("[Better Chests] " .. put_back .. " items did not follow the plan and were put back.")
+    end
+    Say(player, string.format(MESSAGES.ORGANIZED, #chests, Plural(#chests)))
 end
 
-local function GetTrueUncrossableItems(validItems)
-	local uncrossableItems = {}
-	for chest, itemChecking in pairs(validItems) do
-		local uncrossedItemsInThisChest = itemChecking.invalidItems
-		local trueUncrossableByChest = {}
-		if uncrossedItemsInThisChest ~= nil then
-			local validItemsInThisChest = itemChecking.validItems
-			for _, uncrossable in pairs(uncrossedItemsInThisChest) do
-				local hasValidValue = false
-				for _, validItem in pairs(validItemsInThisChest) do
-					if uncrossable == validItem.item then
-						hasValidValue = true
-					end
-				end
-				if not hasValidValue then
-					table.insert(trueUncrossableByChest, uncrossable)
-				end
-			end
-		end
-		uncrossableItems[chest] = trueUncrossableByChest
-	end
-	TheNet:SystemMessage("Uncrossable Items: " .. TableToString(uncrossableItems))
+--------------------------------------------------------------------------------------------------
+-- Quick stack
+--------------------------------------------------------------------------------------------------
 
-	local uncrossableCount = {}
-	for chest, uncrossableItemList in pairs(uncrossableItems) do
-		for _, uncrossableItem in ipairs(uncrossableItemList) do
-			if uncrossableCount[uncrossableItem] == nil then
-				uncrossableCount[uncrossableItem] = 0
-			else
-				uncrossableCount[uncrossableItem] = uncrossableCount[uncrossableItem] + 1
-			end
-		end
-	end
+local function QuickStack(player)
+    local inventory = player.components.inventory
+    local chests = FindContainers(player, QUICKSTACK_FRIDGES, true)
+    if #chests == 0 then
+        return Say(player, MESSAGES.NO_CHESTS)
+    end
 
-	TheNet:SystemMessage("Uncrossable Count: " .. TableToString(uncrossableCount))
+    -- For each prefab, the chests that already hold it, the fullest first.
+    local holders = {}
+    for index, inst in ipairs(chests) do
+        local container = inst.components.container
+        local units = {}
+        for slot = 1, container:GetNumSlots() do
+            local item = container:GetItemInSlot(slot)
+            if item ~= nil then
+                units[item.prefab] = (units[item.prefab] or 0) + StackSize(item)
+            end
+        end
+        for prefab, count in pairs(units) do
+            holders[prefab] = holders[prefab] or {}
+            table.insert(holders[prefab], { container = container, units = count, index = index })
+        end
+    end
+    for _, list in pairs(holders) do
+        table.sort(list, function(a, b)
+            if a.units ~= b.units then
+                return a.units > b.units
+            end
+            return a.index < b.index
+        end)
+    end
 
-	local rejectedOnAllChestItems = {}
-	for item, count in pairs(uncrossableCount) do
-		if count >= #validItems - 2 then
-			table.insert(rejectedOnAllChestItems, item)
-		end
-	end
+    -- Only stackable items move: tools, weapons and clothes stay with the player.
+    local sources = {}
+    local backpack = QUICKSTACK_BACKPACK and inventory:GetOverflowContainer() or nil
+    for _, owner in ipairs({ inventory, backpack }) do
+        for slot = 1, owner:GetNumSlots() do
+            local item = owner:GetItemInSlot(slot)
+            if item ~= nil and item.components.stackable ~= nil and holders[item.prefab] ~= nil then
+                table.insert(sources, { owner = owner, slot = slot, item = item })
+            end
+        end
+    end
 
-	return rejectedOnAllChestItems
+    local moved, removed_items = 0, {}
+    local ok, err = G.pcall(function()
+        for _, source in ipairs(sources) do
+            local item = source.item
+            local before = StackSize(item)
+            local removed
+            if source.owner == inventory then
+                removed = inventory:RemoveItem(item, true)
+            else
+                removed = source.owner:RemoveItemBySlot(source.slot)
+            end
+            if removed ~= nil then
+                table.insert(removed_items, removed)
+                local rest = removed
+                for _, holder in ipairs(holders[item.prefab]) do
+                    if holder.container:GiveItem(rest, nil, nil, false) then
+                        rest = nil
+                        break
+                    end
+                end
+                moved = moved + before - (rest ~= nil and StackSize(rest) or 0)
+                if rest ~= nil then
+                    -- What didn't fit goes back where it came from.
+                    if source.owner == inventory then
+                        inventory:GiveItem(rest, source.slot)
+                    elseif not source.owner:GiveItem(rest, source.slot, nil, false) then
+                        inventory:GiveItem(rest)
+                    end
+                end
+            end
+        end
+    end)
+    if not ok then
+        print("[Better Chests] quick stack failed and items were put back: " .. tostring(err))
+    end
+    for _, item in ipairs(removed_items) do
+        if IsLoose(item) then
+            GiveToPlayer(player, item)
+        end
+    end
+
+    if moved > 0 then
+        Say(player, string.format(MESSAGES.STACKED, moved, Plural(moved)))
+    else
+        Say(player, MESSAGES.NOTHING_TO_STACK)
+    end
 end
 
---Sort Function
-GLOBAL.TheInput:AddKeyDownHandler(GLOBAL.KEY_Z, function()
-	local player = GLOBAL.ThePlayer
-	if player then
-		--Get chests
-		local allCloseChests, chestRef = GetNearbyChests(player)
+--------------------------------------------------------------------------------------------------
+-- Server side: RPC handlers
+--------------------------------------------------------------------------------------------------
 
-		--Get items
-		local allItemsByChest, itemsRef = GetAllItemsFromChests(chestRef)
+local last_request = G.setmetatable({}, { __mode = "k" })
 
-		--Get components
-		local componentsByItem, componentReference = GetAllComponentsFromItems(itemsRef)
+local function HandleRequest(player, action)
+    if player == nil or not player:IsValid() or player:HasTag("playerghost") or player.components.inventory == nil then
+        return
+    end
+    local now = G.GetTime()
+    if last_request[player] ~= nil and now - last_request[player] < COOLDOWN then
+        return
+    end
+    last_request[player] = now
 
-		local tagsByItem = GetAllTagsFromItems(itemsRef)
+    local ok, err = G.pcall(action, player)
+    if not ok then
+        print("[Better Chests] error: " .. tostring(err))
+    end
+end
 
-		--Count item by stacks
-		local nonStackables, stackables = GetQuantityOfEachItem(itemsRef)
-
-		--Cross components (score) similarity in a matrix.
-		local matrixCrossingTable = GetCrossedTableValues(componentsByItem, tagsByItem)
-
-		--Check wich item has less difference (score) between others
-		local deviationValue = CheckDeviationFromCrossedTable(matrixCrossingTable)
-
-		--Set a Key Item for each chest.
-		local keyItemByChest = GetKeyItemForEachChest(allCloseChests, deviationValue)
-
-		local itemListByChest = CreateRecursiveStructureWithKeys(keyItemByChest, chestRef)
-
-		local validItems = GetActualValidItems(itemListByChest, matrixCrossingTable)
-		print("Valid Items: " .. TableToString(validItems))
-
-		local rejectedOnAllChestItems = GetTrueUncrossableItems(validItems)
-		TheNet:SystemMessage("Rejected on all chests: " .. TableToString(rejectedOnAllChestItems))
-
-		while CountDictionary(validItems) > 0 do
-			itemListByChest = GetOneItemForEachChestBasedOnContents(itemListByChest, validItems)
-			TheNet:SystemMessage("Score chest: " .. TableToString(itemListByChest))
-			validItems = GetActualValidItems(itemListByChest, matrixCrossingTable)
-			TheNet:SystemMessage("Valid items: " .. TableToString(validItems))
-		end
-
-		--Fill Chests
-		PutItemsInChest(stackables, nonStackables, itemListByChest, chestRef)
-
-		--Trocar isso aqui pra uma funcao fora do for que faz tudo dentro e checa pela lista nao pelo componente
-		for _, chest in pairs(chestRef) do
-			RenameChestBasedOnComponents(chest)
-		end
-	end
+AddModRPCHandler(NAMESPACE, "Organize", function(player)
+    HandleRequest(player, Organize)
 end)
 
---Quick Stack function
-GLOBAL.TheInput:AddKeyDownHandler(GLOBAL.KEY_X, function()
-	local player = GLOBAL.ThePlayer
-	if player then
-		--Get Player Inventory
-		local playerInventory = player.components.inventory
-		if playerInventory then
-			--Get Chests
-			local allCloseChests, chestRef = GetNearbyChests(player)
-			--Get Items
-			local allItemsByChest, itemsRef = GetAllItemsFromChests(chestRef)
-			--Remove items from player inventory
-			local removedItemsFromInventory = RemoveItemsFromPlayerInventory(playerInventory, itemsRef)
-			--Put removed inventory items in the chests
-			SortRemovedItemsInChests(allItemsByChest, removedItemsFromInventory)
-		end
-	end
+AddModRPCHandler(NAMESPACE, "QuickStack", function(player)
+    HandleRequest(player, QuickStack)
 end)
 
--- Add this function to your existing code
-local function SpawnDebugItems()
-	local player = GLOBAL.ThePlayer
-	if not player then return end
+--------------------------------------------------------------------------------------------------
+-- Client side: key bindings (configured per player)
+--------------------------------------------------------------------------------------------------
 
-	-- Organized item categories
-	local debug_categories = {
-		{
-			name = "Base Resources",
-			items = {"log", "twigs", "rocks", "flint", "cutreeds", "charcoal", "pinecone",
-					 "boards", "cutstone", "rope", "papyrus", "houndstooth", "silk", "goldnugget",
-					 "marble", "thulecite", "livinglog"}
-		},
-		{
-			name = "Tools/Weapons",
-			items = {"axe", "pickaxe", "shovel", "hammer", "bugnet", "fishingrod", "razor", "pitchfork",
-					 "spear", "tentaclespike", "boomerang", "blowdart_pipe", "nightstick", "batbat",
-					 "hambat", "ruins_bat", "nightsword"},
-		},
-		{
-			name = "Mob Drops",
-			items = {
-				"spidergland", "stinger", "tentaclespots", "phlegm",
-				"slurper_pelt", "batwing", "beardhair", "furtuft",
-				"coontail", "deerclops_eyeball", "glommerfuel", "dragon_scales",
-				"slurtleslime", "snurtleshell", "rock_avocado_fruit",
-				"cookiecuttershell", "venomgland", "snakeskin", "nightmarefuel", "pigskin"
-			}
-		},
-		{
-			name = "Armor/Clothing",
-			items = {"armorwood", "footballhat", "armormarble", "armorgrass", "armorslurper",
-					 "armorsnurtleshell", "sweater", "trunkvest_summer", "raincoat", "catcoonhat",
-					 "beefalohat", "winterhat"},
-		},
-		{
-			name = "Structures",
-			items = {"wall_hay_item", "wall_wood_item", "wall_stone_item", "fence_gate_item", "signitem"},
-		},
-		{
-			name = "Food",
-			items = {"berries", "carrot", "meat", "fish", "monstermeat", "dragonfruit", "pomegranate",
-					 "watermelon", "cookedmeat", "cookedmonstermeat", "fishsticks", "frogglebunwich",
-					 "taffy", "dragonpie"},
-		},
-		{
-			name = "Magic Items",
-			items = {"telestaff", "icestaff", "firestaff", "orangestaff", "greenstaff", "yellowstaff",
-					 "nightsword", "armor_sanity", "amulet", "purpleamulet", "orangeamulet", "yellowamulet",
-					 "panflute", "onemanband"},
-		}
-	}
-
-	local pos = player:GetPosition()
-	local start_x = pos.x + 3  -- Start 3 units right of player
-	local start_z = pos.z      -- Align with player's Z position
-	local row_spacing = 1      -- Space between rows
-
-	local actualChestIdx = 1
-	local lastChestIdx = 0
-	local actualChest
-	local startCount = 1
-	local endCount = 0
-	for cat_idx, category in ipairs(debug_categories) do
-		endCount = endCount + #category.items
-		for i = startCount, endCount do
-			local chestIsFull = i % 9 == 0
-
-			if chestIsFull then
-				lastChestIdx = actualChestIdx
-				actualChestIdx = actualChestIdx + 1
-			end
-
-			if actualChestIdx ~= lastChestIdx then
-				local row_x = start_x
-				local row_z = start_z + (lastChestIdx * row_spacing)
-				actualChest = GLOBAL.SpawnPrefab("treasurechest")
-				actualChest.Transform:SetPosition(row_x, 0, row_z)
-				lastChestIdx = actualChestIdx
-			end
-
-			-- Fill chest with items
-			local item = GLOBAL.SpawnPrefab(category.items[i - startCount + 1])
-			if item and actualChest.components.container then
-				actualChest.components.container:GiveItem(item)
-			end
-		end
-		startCount = endCount + 1
-	end
+local function ConfiguredKey(option)
+    local value = GetModConfigData(option, true)
+    if type(value) ~= "string" or value == "none" then
+        return nil
+    end
+    return G.rawget(G, value)
 end
 
--- Keep your existing key handler
-GLOBAL.TheInput:AddKeyDownHandler(GLOBAL.KEY_V, function()
-	SpawnDebugItems()
-end)
+local function CanSendRequest()
+    local player = G.ThePlayer
+    return player ~= nil
+        and player.HUD ~= nil
+        and not player.HUD:HasInputFocus() -- chat, console, pause menu, crafting menu...
+        and not player:HasTag("playerghost")
+end
+
+local function BindKey(option, rpc_name)
+    local key = ConfiguredKey(option)
+    if key == nil then
+        return
+    end
+    G.TheInput:AddKeyDownHandler(key, function()
+        if CanSendRequest() then
+            SendModRPCToServer(GetModRPC(NAMESPACE, rpc_name))
+        end
+    end)
+end
+
+if not G.TheNet:IsDedicated() then
+    BindKey("organize_key", "Organize")
+    BindKey("quickstack_key", "QuickStack")
+end
